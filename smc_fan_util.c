@@ -3,11 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <IOKit/IOKitLib.h>
 #include <syslog.h>
+#include <signal.h>
 #include "smc.h"
 
 #ifndef DEBUG
@@ -21,11 +23,28 @@
 // use json configuration file
 // print warnings when the user sets a fan speed above apple's limits
 
+// set by --capped-auto so that the fans are handed back to the SMC
+// if the daemon is stopped, instead of being left pinned or stopped.
+bool restoreSMCOnExit = false;
+
+// --no-daemon keeps the process in the foreground so that launchd can supervise
+// it directly (KeepAlive) instead of losing track of a forked child.
+bool runInForeground = false;
+
+int writeValue(char *key, char *in_value);
+
 void signal_handler(int signal)
 {
     #ifdef DEBUG
     printf("daemon ended.\n");
     #endif
+
+    if (restoreSMCOnExit)
+    {
+        writeValue("F0Md", "00");
+        writeValue("F1Md", "00");
+    }
+
     smc_close();
     syslog(LOG_NOTICE, "smc_fan_util daemon terminated.");
     closelog();
@@ -443,6 +462,11 @@ void printUsage()
             "        Note: Be sure to monitor temperatures to avoid overheat!!!\n"
             "    -h: display this message.\n"
             "    -i: show fan information.\n"
+            "    -t: print the CPU temperature in degrees Celsius.\n"
+            "    --capped-auto <max_rpm>: temperature-driven fan curve that never exceeds max_rpm.\n"
+            "        The fan is stopped below 50C, starts at 55C, and reaches max_rpm at 85C.\n"
+            "        Runs as a daemon. Hands control back to the SMC above 95C.\n"
+            "        Add --no-daemon to stay in the foreground (for launchd KeepAlive).\n"
             "    -m <percentage>: set fan speeds to a specific percentage manually.\n"
             "    -m <speed_left> <speed_right>: set fan speeds to specific speeds manually.\n"
             "        Note: If you set fan speeds by RPM, it ignores Apple's limits.\n"
@@ -451,7 +475,8 @@ void printUsage()
             "EXAMPLES:\n"
             "    smc_fan_util -m 50        // set both fans to 50 percent\n"
             "    smc_fan_util -m 1080 1000 // left: 1080rpm; right: 1000rpm\n"
-            "    smc_fan_util -a           // set fans to auto mode (SMC)\n");
+            "    smc_fan_util -a           // set fans to auto mode (SMC)\n"
+            "    smc_fan_util --capped-auto 2500 // auto curve, never above 2500rpm\n");
 }
 
 void setFanSpeedAccordingToTemperature(double temperature)
@@ -582,6 +607,183 @@ void setFanSpeedAccordingToTemperature(double temperature)
 
     setFanSpeed(0, fan0TargetRPM);
     setFanSpeed(1, fan1TargetRPM);
+}
+
+
+void exit_failure(void);
+void exit_success(void);
+
+// TCMX is not implemented on every Mac (notably the 2018 Mac mini), so probe a
+// few core-temperature sensors and use the first one that reports a sane value.
+double ReadCPUTemperature(void)
+{
+    static const char *candidates[] = {"TCXC", "TCMX", "TCSA", "TC0P", NULL};
+
+    for (size_t i = 0; candidates[i]; i++)
+    {
+        double temperature = getFloatFromKey(candidates[i]);
+
+        if (temperature > 0.0 && temperature < 150.0)
+        {
+            return temperature;
+        }
+    }
+
+    return -1.0;
+}
+
+// Let the fan idle completely but never let it exceed maxRPM.
+// The SMC minimum (F0Mn) cannot be undercut while the fan is running,
+// so the usable range is {0} + [F0Mn, maxRPM].
+void runCappedAuto(double maxRPM)
+{
+    const double TEMP_FAN_OFF   = 50.0;  // below this the fan is stopped
+    const double TEMP_FAN_ON    = 55.0;  // rising edge, hysteresis against TEMP_FAN_OFF
+    const double TEMP_FULL_TILT = 85.0;  // maxRPM is reached here
+    const double TEMP_PANIC     = 95.0;  // hand control back to the SMC
+    const double TEMP_RECOVER   = 80.0;  // ...and take it back again here
+    const size_t TEMP_LOG_DURATION = 10;
+
+    const double minRPM = getFloatFromKey("F0Mn");
+
+    if (ReadCPUTemperature() < 0.0)
+    {
+        puts("Error: no usable CPU temperature sensor found. Refusing to control the fans.");
+        exit_failure();
+    }
+
+    #ifdef DAEMON
+
+    if (!runInForeground)
+    {
+        smc_close();
+        daemonize();
+        smc_init();
+    }
+
+    #endif
+
+    if (runInForeground)
+    {
+        // daemonize() installs these itself; do it here for the foreground case
+        // so that a launchd stop still hands the fans back to the SMC.
+        signal(SIGTERM, signal_handler);
+        signal(SIGHUP, signal_handler);
+        signal(SIGINT, signal_handler);
+    }
+
+    openlog("smc_fan_util", LOG_PID, LOG_DAEMON);
+    syslog(LOG_NOTICE, "smc_fan_util capped-auto started (max %.0f rpm).", maxRPM);
+
+    restoreSMCOnExit = true;
+
+    double tempHistory[TEMP_LOG_DURATION];
+    double temperatureNow = ReadCPUTemperature();
+
+    for (size_t i = 0; i < TEMP_LOG_DURATION; i++)
+    {
+        tempHistory[i] = temperatureNow;
+    }
+
+    size_t idxTempHistory = 0;
+    bool areFansOn = true;
+    bool isPanicking = false;
+
+    for (;;)
+    {
+        sleep(1);
+
+        temperatureNow = ReadCPUTemperature();
+
+        if (temperatureNow < 0.0)
+        {
+            // lost the sensor: the safe thing to do is to stop guessing.
+            syslog(LOG_ERR, "smc_fan_util lost the temperature sensor, reverting to SMC.");
+            writeValue("F0Md", "00");
+            writeValue("F1Md", "00");
+            exit_failure();
+        }
+
+        tempHistory[idxTempHistory] = temperatureNow;
+        idxTempHistory = (idxTempHistory + 1) % TEMP_LOG_DURATION;
+
+        double sumTemp = 0.0;
+
+        for (size_t i = 0; i < TEMP_LOG_DURATION; i++)
+        {
+            sumTemp += tempHistory[i];
+        }
+
+        double avgTemp = sumTemp / (double)TEMP_LOG_DURATION;
+
+        // The instantaneous reading drives the failsafe, the average drives the curve.
+        if (!isPanicking && temperatureNow >= TEMP_PANIC)
+        {
+            isPanicking = true;
+            writeValue("F0Md", "00");
+            writeValue("F1Md", "00");
+            areFansOn = true;
+            syslog(LOG_WARNING, "smc_fan_util: %.1fC >= %.1fC, releasing the fans to the SMC.",
+                   temperatureNow, TEMP_PANIC);
+        }
+        else if (isPanicking && avgTemp < TEMP_RECOVER)
+        {
+            isPanicking = false;
+            syslog(LOG_NOTICE, "smc_fan_util: cooled to %.1fC, reapplying the %.0f rpm cap.",
+                   avgTemp, maxRPM);
+        }
+
+        #ifdef DEBUG
+        printf("cur: %.1f | avg: %.1f | panic: %d | ", temperatureNow, avgTemp, isPanicking);
+        #endif
+
+        if (isPanicking)
+        {
+            #ifdef DEBUG
+            printf("smc\n");
+            fflush(stdout);
+            #endif
+            continue;
+        }
+
+        double targetRPM;
+
+        if (avgTemp >= TEMP_FULL_TILT)
+        {
+            targetRPM = maxRPM;
+        }
+        else if (avgTemp >= TEMP_FAN_ON || (areFansOn && avgTemp >= TEMP_FAN_OFF))
+        {
+            double span = TEMP_FULL_TILT - TEMP_FAN_ON;
+            double ratio = (avgTemp - TEMP_FAN_ON) / span;
+
+            if (ratio < 0.0)
+            {
+                ratio = 0.0;
+            }
+
+            targetRPM = minRPM + (maxRPM - minRPM) * ratio;
+        }
+        else
+        {
+            targetRPM = 0.0;
+        }
+
+        if (targetRPM > maxRPM)
+        {
+            targetRPM = maxRPM;
+        }
+
+        areFansOn = (targetRPM > 0.0);
+
+        #ifdef DEBUG
+        printf("tg: %.0f\n", targetRPM);
+        fflush(stdout);
+        #endif
+
+        setFanSpeed(0, targetRPM);
+        setFanSpeed(1, targetRPM);
+    }
 }
 
 void exit_failure()
@@ -1006,6 +1208,63 @@ int main(int argc, char *argv[])
             }
 
 
+        }
+    }
+    else if (!strcmp(argv[1], "--capped-auto"))
+    {
+        if (!(argc == 3 || argc == 4))
+        {
+            puts("Incorrect parameters.");
+            puts("Use option \"-h\" for help.");
+            exit_failure();
+        }
+        else if (argc == 4 && strcmp(argv[3], "--no-daemon"))
+        {
+            puts("Incorrect parameters.");
+            puts("Use option \"-h\" for help.");
+            exit_failure();
+        }
+        else if (strspn(argv[2], "0123456789") != strlen(argv[2]))
+        {
+            puts("The parameter should only be integers.");
+            puts("Use option \"-h\" for help.");
+            exit_failure();
+        }
+        else
+        {
+            runInForeground = (argc == 4);
+            double maxRPM = (double)atoi(argv[2]);
+            double fanMinSpeed = getFloatFromKey("F0Mn");
+
+            if (maxRPM < fanMinSpeed)
+            {
+                printf("Error: the cap must be at least F0Mn (%.0f rpm).\n", fanMinSpeed);
+                exit_failure();
+            }
+
+            runCappedAuto(maxRPM);
+        }
+    }
+    else if (!strcmp(argv[1], "-t"))
+    {
+        if (argc != 2)
+        {
+            puts("Incorrect parameters.");
+            puts("Use option \"-h\" for help.");
+            exit_failure();
+        }
+        else
+        {
+            double temperature = ReadCPUTemperature();
+
+            if (temperature < 0.0)
+            {
+                puts("Error: no usable CPU temperature sensor found.");
+                exit_failure();
+            }
+
+            printf("%.1f\n", temperature);
+            exit_success();
         }
     }
     else if (!strcmp(argv[1], "-h"))
