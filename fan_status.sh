@@ -1,6 +1,7 @@
 #!/bin/bash
 # Print fan speed, CPU temperature and available memory for a tmux status bar,
-# e.g. "Fan 0 CPU 50°C Ram 55GB".
+# e.g. "FAN1785 CPU59C RAM39G" (fan rpm, CPU degrees C, available RAM GiB).
+# Plain ASCII on purpose: symbol glyphs rendered inconsistently in the status bar.
 #
 # All three are gathered in one pass and cached for POLL_SECONDS, so this stays
 # cheap even though tmux redraws the status bar every second (status-interval 1,
@@ -39,5 +40,5 @@ mem=$(vm_stat | awk '
 [ -z "$mem" ] && mem="?"
 
 # write atomically so a concurrent reader never sees a half-written file
-printf 'Fan %s CPU %s°C Ram %sGB' "$rpm" "$temp" "$mem" > "$CACHE.$$" && mv -f "$CACHE.$$" "$CACHE"
+printf 'FAN%s CPU%sC RAM%sG ' "$rpm" "$temp" "$mem" > "$CACHE.$$" && mv -f "$CACHE.$$" "$CACHE"
 cat "$CACHE"
